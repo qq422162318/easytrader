@@ -1,0 +1,13 @@
+pywinauto
+bs4
+requests
+dill
+click
+six
+flask
+Pillow
+pytesseract
+pandas
+pyperclip
+rqopen-client>=0.0.5
+
