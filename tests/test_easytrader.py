@@ -8,7 +8,7 @@ sys.path.append(".")
 
 TEST_CLIENTS = os.environ.get("EZ_TEST_CLIENTS", "")
 
-IS_WIN_PLATFORM = sys.platform != "darwin"
+IS_WIN_PLATFORM = sys.platform == "win32"
 
 
 @unittest.skipUnless("yh" in TEST_CLIENTS and IS_WIN_PLATFORM, "skip yh test")

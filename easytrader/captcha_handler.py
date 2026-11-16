@@ -1,29 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Read-only detection of the THS captcha dialog.
+"""Read-only discovery and explicit auto-filling of the THS captcha dialog.
 
 The dialog and all of its child HWNDs are created dynamically by Windows.
 Call :func:`discover_captcha_dialog` each time the dialog is needed; never
 persist an HWND across a dialog close/reopen or a client restart.
 
-This module deliberately does not capture the captcha image, type text, click
-buttons, or close the dialog.  It only reports the current window metadata so
-caller-owned code can decide what to do.
+Discovery only reports window metadata.  Screen capture, OCR, typing and
+clicking happen only through :func:`auto_fill_captcha`; its optional OCR
+packages are not required to import this module or inspect a dialog.
 """
 import os
+import re
 import tempfile
 import time
 
-import win32api
 import win32con
 import win32gui
 import win32process
-import numpy as np
-from .log import log
-from aip import AipOcr
-import mss
-import mss.tools
-import cv2
 from pywinauto import Application
+
+from . import exceptions
+from .log import log
 
 _CAPTCHA_KEYWORDS = ("拷贝数据", "验证码")
 _DIALOG_CLASS = "#32770"
@@ -201,8 +198,8 @@ def auto_fill_captcha(app):
     """OCR the captcha image, fill the Edit control, and click OK.
 
     Returns ``True`` when a captcha dialog was present and an auto-fill
-    attempt was made; ``False`` when no dialog was found (or the dialog was
-    still mid-creation with no editable/OK controls).  Discovery is
+    attempt was made; ``False`` when no complete dialog or OCR text was
+    found.  Discovery is
     read-only; this function is the only place that types and clicks, so the
     caller controls exactly when the client gets a code.
     """
@@ -210,80 +207,113 @@ def auto_fill_captcha(app):
     if snapshot is None:
         return False
 
-    def _pick(controls):
-        image = next((i for i in controls if i["control_id"] == 2405), None)
-        edit = next((i for i in controls if i["control_id"] == 2404), None)
-        yes = next((i for i in controls if i["control_id"] == 1), None)
+    def _pick(snapshot):
+        image = _find_control(snapshot, control_id=_CAPTCHA_IMAGE_CONTROL_ID)
+        edit = _find_control(
+            snapshot, control_id=_CAPTCHA_EDIT_CONTROL_ID, class_name="Edit"
+        )
+        yes = _find_control(snapshot, control_id=1, class_name="Button")
         return image, edit, yes
+    try:
+        image_control, edit_control, yes_control = _pick(snapshot)
 
-    image_control, edit_control, yes_control = _pick(snapshot["controls"])
+        # 弹窗可能仍在创建中；图像、输入框及确定按钮都必须就绪。
+        if (image_control is None or not image_control.get("rect")
+                or edit_control is None or yes_control is None):
+            time.sleep(0.5)
+            snapshot = discover_captcha_dialog(app)
+            if snapshot is None:
+                return False
+            image_control, edit_control, yes_control = _pick(snapshot)
+            if (image_control is None or not image_control.get("rect")
+                    or edit_control is None or yes_control is None):
+                return False
 
-    # 弹窗可能还在创建中(只枚举到部分控件, 缺输入框/确定按钮), 稍等重探一次。
-    if edit_control is None or yes_control is None:
-        time.sleep(0.5)
-        snapshot = discover_captcha_dialog(app)
-        if snapshot is None:
-            return False
-        image_control, edit_control, yes_control = _pick(snapshot["controls"])
-        if edit_control is None or yes_control is None:
-            # 仍不完整, 不假装填了, 交给调用方处理。
-            return False
-
-    controls = snapshot["controls"]
-    text = ""
-    if image_control and image_control["rect"]:
-        print("图片控件 HWND:", hex(image_control["hwnd"]))
         left, top, right, bottom = image_control["rect"]
-        text = ocr_pos(top, left, right - left, bottom - top)
+        if right <= left or bottom <= top:
+            return False
+        text = ocr_pos(top, left, right - left, bottom - top).strip()
+        if not re.fullmatch(r"[0-9]{4}", text):
+            # 此拷贝验证码为四位数字；空白/残缺识别保留人工输入，不点击确定。
+            return False
 
-    if edit_control:
-        print("输入框 HWND:", hex(edit_control["hwnd"]))
         app2 = Application(backend="win32").connect(handle=snapshot["dialog_hwnd"])
         dlg = app2.window(handle=snapshot["dialog_hwnd"])
-        edit_spec = dlg.child_window(control_id=2404, class_name="Edit")
-        edit_spec.set_focus()
-        # 清掉可能残留的上一次字符(如上次输错的验证码), 再输入本次结果。
-        edit_spec.type_keys("^a{BS}", set_foreground=True)
+        edit_spec = dlg.child_window(control_id=_CAPTCHA_EDIT_CONTROL_ID,
+                                     class_name="Edit")
+        # 同花顺的 Edit 不可靠地支持 Ctrl+A/文本读回；不能因读回空串重填。
+        # 保持弹窗在前台、明确设置键盘焦点，再选中整行替换原有验证码。
+        dlg.set_focus()
+        edit_spec.set_keyboard_focus()
         edit_spec.type_keys(
-            str(text), with_spaces=True, set_foreground=True
+            "{HOME}+{END}{BACKSPACE}", set_foreground=False,
+            vk_packet=False, pause=0.1,
         )
-
-    if yes_control:
-        print("确定按钮 HWND:", hex(yes_control["hwnd"]))
-        dlg.child_window(control_id=1, class_name="Button").click()
+        edit_spec.type_keys(
+            text, with_spaces=True, set_foreground=False,
+            vk_packet=False, pause=0.1,
+        )
+        # 激活本次发现的验证码按钮，避免模拟鼠标点击未触发确认。
+        win32gui.SendMessage(yes_control["hwnd"], win32con.BM_CLICK, 0, 0)
+    except Exception as exc:
+        # SDK 异常可能含带凭据的 OAuth URL，不打印完整异常内容。
+        log.warning("自动填写验证码失败 (%s)", type(exc).__name__)
+        return False
     return True
-def ocr_pos(t,l,w,h):
 
-    # 定义截图区域 (left, top, width, height)
+
+def ocr_pos(t, l, w, h):
+    try:
+        import mss
+    except ImportError as exc:
+        raise exceptions.CaptchaError(
+            "自动填写验证码需要 mss，请安装后重试或手工填写验证码"
+        ) from exc
+
     monitor = {"top": t, "left": l, "width": w, "height": h}
-    text = ""
-    # 使用 mss 截图
-    with mss.mss() as sct:
-        screenshot = sct.grab(monitor)
-        # mss 的 screenshot.rgb 是 (h, w, 3) 的 RGB 字节串；
-        # np.array(screenshot) 得到的是 BGRA 四通道，cvtColor 只接受三通道。
-        img = np.frombuffer(screenshot.rgb, dtype=np.uint8).reshape(
-            screenshot.height, screenshot.width, 3
-        )
+    # 每次截图使用独立临时目录，不覆盖桌面文件，也不与并发调用串图。
+    with tempfile.TemporaryDirectory(prefix="easytrader-captcha-") as folder:
+        photo_posi = os.path.join(folder, "captcha.png")
+        with mss.mss() as sct:
+            screenshot = sct.grab(monitor)
 
-        # 图像预处理（可选）
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # 灰度化
-        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)  # 二值化
+        # 预处理结果必须写入实际上传的 PNG，而非仍上传 screenshot.rgb。
+        from PIL import Image, ImageOps
+        width, height = screenshot.size
+        size = (width * 3, height * 3)
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            # Pillow 已是项目依赖；没有可选 OpenCV 时仍执行相同预处理。
+            image = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+            gray = ImageOps.grayscale(image).resize(size, Image.Resampling.BICUBIC)
+            binary = gray.point(lambda value: 255 if value > 150 else 0)
+        else:
+            # mss 原始字节为 BGRA，不能按三通道 RGB/BGR 处理。
+            image = np.frombuffer(screenshot.bgra, dtype=np.uint8).reshape(height, width, 4)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            gray = cv2.resize(gray, size, interpolation=cv2.INTER_CUBIC)
+            _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+            binary = Image.fromarray(binary)
+            gray = Image.fromarray(gray)
+        # 留白避免首尾数字贴边；图像仍只包含验证码控件。
+        ImageOps.expand(binary, border=8, fill=255).save(photo_posi, format="PNG")
+        text = baidu_ocr(photo_posi).strip()
+        if re.fullmatch(r"[0-9]{4}", text):
+            return text
+        # 二值化偶尔切断笔画；不重新截图、不重填，最多再试同图的灰度版本。
+        ImageOps.expand(gray, border=8, fill=255).save(photo_posi, format="PNG")
+        return baidu_ocr(photo_posi).strip()
 
-        # 保存截图（可选）：优先当前用户桌面，目录不存在则退回系统临时目录
-        photo_posi = os.path.join(
-            os.path.expanduser("~"), "Desktop", "temp.png"
-        )
-        if not os.path.isdir(os.path.dirname(photo_posi)):
-            photo_posi = os.path.join(
-                tempfile.gettempdir(), "easytrader_captcha.png"
-            )
-        mss.tools.to_png(screenshot.rgb, screenshot.size, output=photo_posi)
 
-        # 识别截图
-        text = baidu_ocr(photo_posi)
-    return text.strip()
 def baidu_ocr(photo_posi):
+    try:
+        from aip import AipOcr
+    except ImportError as exc:
+        raise exceptions.CaptchaError(
+            "自动填写验证码需要 baidu-aip，请安装后重试或手工填写验证码"
+        ) from exc
     APP_ID = '120885125'
     API_KEY = 'ySAsVIFRLpn3f1y8FKojlfri'
     SECRET_KEY = 'dzUImdQM5QNvHKQYNi2BCurgpIDqTBBu'
@@ -295,11 +325,17 @@ def baidu_ocr(photo_posi):
         result = client.basicGeneral(image)
 
         # 解析结果
-        if 'words_result' in result:
-            return result['words_result'][0]['words']
-        else:
-            log.error("baidu_ocr识别失败:%s", result)
+        words_result = result.get('words_result') or []
+        if words_result:
+            # 验证码可能被识别成多个片段，按百度返回顺序拼接而非只取首段。
+            text = "".join(item.get("words", "") for item in words_result)
+            # 干扰线可能被识别成 ◆ 等符号。仅去掉非字母数字字符；
+            # 保留疑似字母，让 auto_fill_captcha 的四位数字校验拒绝误识别。
+            return "".join(char for char in text if char.isalnum())
+        log.error("baidu_ocr识别失败:%s", result)
     return ""
+
+
 # Descriptive alias for callers that prefer an information-oriented name.
 get_captcha_dialog_info = discover_captcha_dialog
 

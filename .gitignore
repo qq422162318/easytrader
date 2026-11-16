@@ -5,6 +5,7 @@ test.py
 ht_account.json
 gj_client.json
 xq.json
+!easytrader/config/xq.json
 yh_client.json
 .idea
 .vscode

@@ -29,9 +29,12 @@ def post_prepare():
     json_data = request.get_json(force=True)
 
     user = api.use(json_data.pop("broker"))
-    # "ths" 等直连客户端的券商走 connect()（prepare 只定义在登录式子类上）。
-    # connect(exe_path) 直接挂到已运行的客户端，不重新登录。
-    user.connect(**json_data)
+    # 登录式券商使用 prepare；通用同花顺只支持连接已登录的客户端。
+    prepare = getattr(user, "prepare", None)
+    if callable(prepare):
+        prepare(**json_data)
+    else:
+        user.connect(**json_data)
 
     global_store["user"] = user
     return jsonify({"msg": "login success"}), 201

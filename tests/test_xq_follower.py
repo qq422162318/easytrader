@@ -14,7 +14,7 @@ class TestXueQiuTrader(unittest.TestCase):
 
         follower._adjust_sell = False
         amount = follower._adjust_sell_amount("169101", 1000)
-        self.assertEqual(amount, amount)
+        self.assertEqual(1000, amount)
 
     def test_adjust_sell_amount(self):
         follower = XueQiuFollower()

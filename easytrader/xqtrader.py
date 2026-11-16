@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import math
 import numbers
 import os
 import re
@@ -411,19 +412,35 @@ class XueQiuTrader(webtrader.WebTrader):
         :param entrust_bs:
         :return:
         """
+        # 拒绝负数和非有限数，避免 buy/sell 意外执行相反方向的调仓。
+        values = {}
+        for name, value in (("price", price), ("amount", amount),
+                            ("volume", volume)):
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise exceptions.TradeError("{} 必须为非负有限数".format(name))
+            if not math.isfinite(value) or value < 0:
+                raise exceptions.TradeError("{} 必须为非负有限数".format(name))
+            values[name] = value
+        if not values["volume"]:
+            volume = values["price"] * values["amount"]
+            if not math.isfinite(volume):
+                raise exceptions.TradeError(u"操作金额必须为有限数")
+            volume = int(volume)  # 可能要取整数
+        else:
+            volume = values["volume"]
+        if volume == 0:
+            raise exceptions.TradeError(u"操作金额不能为零")
+
         stock = self._search_stock_info(security)
         balance = self.get_balance()[0]
         if stock is None:
             raise exceptions.TradeError(u"没有查询要操作的股票信息")
-        if not volume:
-            volume = int(float(price) * amount)  # 可能要取整数
         if balance["current_balance"] < volume and entrust_bs == "buy":
             raise exceptions.TradeError(u"没有足够的现金进行操作")
         if stock["flag"] != 1:
             raise exceptions.TradeError(u"未上市、停牌、涨跌停、退市的股票无法操作。")
-        if volume == 0:
-            raise exceptions.TradeError(u"操作金额不能为零")
-
         # 计算调仓调仓份额
         weight = volume / balance["asset_balance"] * 100
         weight = round(weight, 2)

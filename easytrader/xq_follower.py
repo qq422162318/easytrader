@@ -77,8 +77,14 @@ class XueQiuFollower(BaseFollower):
         self._users = users
 
         strategies = self.warp_list(strategies)
-        total_assets = self.warp_list(total_assets)
-        initial_assets = self.warp_list(initial_assets)
+        if not isinstance(total_assets, list):
+            total_assets = [total_assets] * len(strategies)
+        if not isinstance(initial_assets, list):
+            initial_assets = [initial_assets] * len(strategies)
+        for name, assets in (('total_assets', total_assets),
+                             ('initial_assets', initial_assets)):
+            if len(assets) != len(strategies):
+                raise ValueError('{} must have one value per strategy'.format(name))
 
         if cmd_cache:
             self.load_expired_cmd_cache()
@@ -165,7 +171,7 @@ class XueQiuFollower(BaseFollower):
             t['action'] = 'buy' if weight_diff > 0 else 'sell'
 
             t['amount'] = int(round(initial_amount, -2))
-            if self._adjust_sell:
+            if self._adjust_sell and t['action'] == 'sell':
                 t['amount'] = self._adjust_sell_amount(t['stock_code'],
                                                        t['amount'])
 

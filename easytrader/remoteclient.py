@@ -32,14 +32,15 @@ class RemoteClient:
         :param comm_password: 通讯密码
         :return:
         """
-        params = locals().copy()
-        params.pop("self")
-
+        params = {
+            "user": user,
+            "password": password,
+            "exe_path": exe_path,
+            "comm_password": comm_password,
+        }
         if config_path is not None:
-            account = helpers.file2dict(config_path)
-            params["user"] = account["user"]
-            params["password"] = account["password"]
-
+            params.update(helpers.file2dict(config_path))
+        params.update(kwargs)
         params["broker"] = self._broker
 
         response = self._s.post(self._api + "/prepare", json=params)
@@ -77,8 +78,8 @@ class RemoteClient:
         return response.json()
 
     def buy(self, security, price, amount, **kwargs):
-        params = locals().copy()
-        params.pop("self")
+        params = {"security": security, "price": price, "amount": amount}
+        params.update(kwargs)
 
         response = self._s.post(self._api + "/buy", json=params)
         if response.status_code >= 300:
@@ -86,8 +87,8 @@ class RemoteClient:
         return response.json()
 
     def sell(self, security, price, amount, **kwargs):
-        params = locals().copy()
-        params.pop("self")
+        params = {"security": security, "price": price, "amount": amount}
+        params.update(kwargs)
 
         response = self._s.post(self._api + "/sell", json=params)
         if response.status_code >= 300:

@@ -28,7 +28,7 @@ def use(broker, debug=True, **kwargs):
     """
     if not debug:
         log.setLevel(logging.INFO)
-    elif broker.lower() in ["xq", "雪球"]:
+    if broker.lower() in ["xq", "雪球"]:
         return XueQiuTrader(**kwargs)
     elif broker.lower() in ["yh_client", "银河客户端"]:
         from .yh_clienttrader import YHClientTrader

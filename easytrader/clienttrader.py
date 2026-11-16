@@ -236,11 +236,11 @@ class ClientTrader(IClientTrader):
 
     def _set_market_trade_type(self, ttype):
         """根据选择的市价交易类型选择对应的下拉选项"""
-        selects = self._main(
+        selects = self._main.window(
             control_id=self._config.TRADE_MARKET_TYPE_CONTROL_ID,
             class_name="ComboBox",
         )
-        for i, text in selects.texts():
+        for i, text in enumerate(selects.texts()):
             # skip 0 index, because 0 index is current select index
             if i == 0:
                 continue
@@ -306,11 +306,9 @@ class ClientTrader(IClientTrader):
 
         self._type_keys(self._config.TRADE_SECURITY_CONTROL_ID, code)
 
-        # 输入证券代码后，客户端会自行带出价格(TRADE_PRICE_CONTROL_ID)与
-        # 可买/可卖数量，因此这里不再写价格框。price 参数仅作保留，
-        # 以免破坏 buy()/sell() 的签名。
+        # 等待客户端带出行情后，再写入调用者指定的限价。
         self.wait(0.3)
-
+        self._type_keys(self._config.TRADE_PRICE_CONTROL_ID, str(price))
         self._type_keys(self._config.TRADE_AMOUNT_CONTROL_ID, str(int(amount)))
 
     def _set_market_trade_params(self, security, amount):
@@ -341,6 +339,7 @@ class ClientTrader(IClientTrader):
         handle = self._main.window(control_id=control_id, class_name="Edit")
         handle.click_input()
         self.wait(0.3)
+        handle.type_keys("^a{BACKSPACE}")
         handle.type_keys(str(text), with_spaces=False)
 
     def _switch_left_menus(self, path, sleep=0.2):

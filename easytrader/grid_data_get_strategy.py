@@ -72,11 +72,16 @@ class CopyStrategy(BaseStrategy):
             # 拷贝可能刚触发弹窗、但弹窗还在弹出中(竞态), 稍等再检测。
             time.sleep(0.5)
             if captcha_handler.auto_fill_captcha(self._trader.app):
-                # auto_fill_captcha() 识别验证码并填入输入框、点击确定,
-                # 等待客户端处理后重试拷贝。
-                log.info("检测到验证码弹窗, 已自动填写验证码, 重试拷贝")
+                # 验证通过后，客户端可能继续原来的复制并写入剪贴板。
+                # 先读取这次复制的结果，不能清空后立刻再复制触发新验证码。
+                log.info("检测到验证码弹窗, 已自动填写验证码, 等待复制结果")
                 time.sleep(1)
-                content = self._copy_grid(grid)
+                try:
+                    content = self._get_clipboard_data()
+                except exceptions.GridDataError:
+                    # 不接受返回 True 作为验证码已通过的证明；弹窗仍在时不重试。
+                    if not captcha_handler.discover_captcha_dialogs(self._trader.app):
+                        content = self._copy_grid(grid)
 
         return content
 
@@ -91,6 +96,8 @@ class CopyStrategy(BaseStrategy):
         except Exception:
             pass
         time.sleep(0.2)
+        # 复制可能被验证码拦截；先清空，避免把上一次表格当成本次结果。
+        self._clear_clipboard()
         grid.type_keys("^A^C")
         try:
             return self._get_clipboard_data()
@@ -106,19 +113,34 @@ class CopyStrategy(BaseStrategy):
         )
         return df.to_dict("records")
 
-    def _get_clipboard_data(self):
-        while True:
+    def _clear_clipboard(self):
+        for attempt in range(10):
             try:
-                return pywinauto.clipboard.GetData()
-            except Exception as e:
-                # 只读探测(discover_captcha_dialogs 无副作用), 自动填写由
-                # _read_grid_content() 统一触发, 避免这里把验证码填两次。
-                if captcha_handler.discover_captcha_dialogs(self._trader.app):
-                    raise exceptions.GridDataError(
-                        "客户端弹出验证码提示框, 无法复制表格数据, "
-                        "请先人工输入验证码"
-                    )
-                log.warning("{}, retry ......".format(e))
+                pywinauto.clipboard.EmptyClipboard()
+                return
+            except Exception as exc:
+                if attempt == 9:
+                    raise exceptions.GridDataError("无法清空剪贴板") from exc
+                time.sleep(0.1)
+
+    def _get_clipboard_data(self):
+        last_error = None
+        for attempt in range(10):
+            try:
+                content = pywinauto.clipboard.GetData()
+                if isinstance(content, str) and content.strip():
+                    return content
+            except Exception as exc:
+                last_error = exc
+            # 只读探测，自动填写统一由 _read_grid_content() 触发。
+            if captcha_handler.discover_captcha_dialogs(self._trader.app):
+                raise exceptions.GridDataError(
+                    "客户端弹出验证码提示框, 无法复制表格数据, "
+                    "请先人工输入验证码"
+                )
+            if attempt < 9:
+                time.sleep(0.1)
+        raise exceptions.GridDataError("读取剪贴板超时, 未获得表格文本") from last_error
 
 
 class XlsStrategy(BaseStrategy):
