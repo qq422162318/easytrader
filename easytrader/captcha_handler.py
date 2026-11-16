@@ -253,13 +253,29 @@ def auto_fill_captcha(app):
             text, with_spaces=True, set_foreground=False,
             vk_packet=False, pause=0.1,
         )
-        # 激活本次发现的验证码按钮，避免模拟鼠标点击未触发确认。
-        win32gui.SendMessage(yes_control["hwnd"], win32con.BM_CLICK, 0, 0)
+        # 激活本次发现的验证码按钮；同步消息也必须有超时，且超时后不重发。
+        win32gui.SendMessageTimeout(
+            yes_control["hwnd"], win32con.BM_CLICK, 0, 0,
+            win32con.SMTO_ABORTIFHUNG | win32con.SMTO_BLOCK, 1000,
+        )
     except Exception as exc:
         # SDK 异常可能含带凭据的 OAuth URL，不打印完整异常内容。
         log.warning("自动填写验证码失败 (%s)", type(exc).__name__)
         return False
     return True
+
+
+def wait_for_captcha_dismissal(app, timeout=5.0):
+    """Read-only wait for all captcha dialogs to close; never retype or click."""
+    deadline = time.monotonic() + timeout
+    for _ in range(max(1, int(timeout / 0.1) + 1)):
+        if not discover_captcha_dialogs(app):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+    return False
 
 
 def ocr_pos(t, l, w, h):
@@ -281,13 +297,13 @@ def ocr_pos(t, l, w, h):
         from PIL import Image, ImageOps
         width, height = screenshot.size
         size = (width * 3, height * 3)
+        color = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
         try:
             import cv2
             import numpy as np
         except ImportError:
             # Pillow 已是项目依赖；没有可选 OpenCV 时仍执行相同预处理。
-            image = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
-            gray = ImageOps.grayscale(image).resize(size, Image.Resampling.BICUBIC)
+            gray = ImageOps.grayscale(color).resize(size, Image.Resampling.BICUBIC)
             binary = gray.point(lambda value: 255 if value > 150 else 0)
         else:
             # mss 原始字节为 BGRA，不能按三通道 RGB/BGR 处理。
@@ -297,14 +313,28 @@ def ocr_pos(t, l, w, h):
             _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
             binary = Image.fromarray(binary)
             gray = Image.fromarray(gray)
-        # 留白避免首尾数字贴边；图像仍只包含验证码控件。
-        ImageOps.expand(binary, border=8, fill=255).save(photo_posi, format="PNG")
-        text = baidu_ocr(photo_posi).strip()
-        if re.fullmatch(r"[0-9]{4}", text):
-            return text
-        # 二值化偶尔切断笔画；不重新截图、不重填，最多再试同图的灰度版本。
-        ImageOps.expand(gray, border=8, fill=255).save(photo_posi, format="PNG")
-        return baidu_ocr(photo_posi).strip()
+
+        def recognize(image):
+            # 留白避免首尾数字贴边；所有版本均来自同一次验证码截图。
+            ImageOps.expand(image, border=8, fill="white").save(photo_posi, format="PNG")
+            return baidu_ocr(photo_posi).strip()
+
+        # 固定二值化可能丢失 4 的横/斜笔画，使四位误码 1964 通过长度校验。
+        # 因此先识别保留笔画的灰度图；仅在不完整时使用二值化备用图。
+        text = recognize(gray)
+        if not re.fullmatch(r"[0-9]{4}", text):
+            text = recognize(binary)
+        if not re.fullmatch(r"[0-9]{4}", text):
+            return ""
+        if "1" in text or "4" in text:
+            # 不全局替换 1/4，也不枚举候选试码。用原彩色放大图交叉核验；
+            # 不一致（包括残缺结果）就保留人工输入、不点击确定。
+            checked = recognize(color.resize(size, Image.Resampling.BICUBIC))
+            if checked != text:
+                log.warning("验证码 1/4 识别核验不一致，已停止自动填写")
+                return ""
+        # 每张截图最多三次 OCR，只有获得最终结果后才会进行一次输入。
+        return text
 
 
 def baidu_ocr(photo_posi):

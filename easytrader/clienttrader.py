@@ -5,7 +5,6 @@ import os
 import sys
 import time
 
-from . import captcha_handler
 from . import grid_data_get_strategy
 from . import helpers
 from . import pop_dialog_handler
@@ -322,15 +321,9 @@ class ClientTrader(IClientTrader):
         self._type_keys(self._config.TRADE_AMOUNT_CONTROL_ID, str(int(amount)))
 
     def _get_grid_data(self, control_id):
-        # 所有 grid 拷贝读取(持仓/委托/成交/撤单)前后都检测验证码弹窗:
-        # - 前置: 清掉上次拷贝残留的弹窗, 避免本次拷贝被挡;
-        # - 后置: 本次拷贝可能又触发新弹窗(反拷贝保护), 立即填掉不留残留。
-        #   try/finally 保证读取成功或抛异常都会执行后置检测。
-        captcha_handler.auto_fill_captcha(self.app)
-        try:
-            return self._grid_data_get_strategy.get(control_id)
-        finally:
-            captcha_handler.auto_fill_captcha(self.app)
+        # 复制策略统一负责已有/新弹窗的提交与有界等待。失败后不能在
+        # finally 中重新 OCR/填码，否则会掩盖超时并再次触发客户端操作。
+        return self._grid_data_get_strategy.get(control_id)
 
     def _type_keys(self, control_id, text):
         # 交易客户端的输入框是 MFC 自绘控件，set_edit_text/WM_SETTEXT 不会

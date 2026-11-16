@@ -100,32 +100,48 @@ class TestGridRegressions(unittest.TestCase):
         )
         self.strategy = grid_data_get_strategy.CopyStrategy(self.trader)
         self.strategy._get_grid = Mock(return_value=self.grid)
+        self._patches = [
+            patch.object(grid_data_get_strategy.captcha_handler,
+                         "discover_captcha_dialogs", return_value=[]),
+            patch.object(grid_data_get_strategy.captcha_handler,
+                         "wait_for_captcha_dismissal", return_value=True),
+            patch.object(grid_data_get_strategy.time, "sleep"),
+        ]
+        for item in self._patches:
+            item.start()
+            self.addCleanup(item.stop)
 
     def test_blocked_copy_does_not_return_previous_table(self):
-        clipboard = {"text": "证券代码\t数量\n162411\t100\n"}
+        clipboard = {"text": "证券代码\t数量\n162411\t100\n", "captcha": False}
 
-        def clear():
+        def clear(**kwargs):
             clipboard["text"] = ""
 
-        with patch.object(grid_data_get_strategy.pywinauto.clipboard,
-                          "EmptyClipboard", side_effect=clear) as empty, \
-                patch.object(grid_data_get_strategy.pywinauto.clipboard,
-                             "GetData", side_effect=lambda: clipboard["text"]), \
+        def copy(keys):
+            clipboard["captcha"] = True
+
+        self.grid.type_keys.side_effect = copy
+        with patch.object(grid_data_get_strategy._clipboard,
+                          "empty", side_effect=clear) as empty, \
+                patch.object(grid_data_get_strategy._clipboard,
+                             "read_text", side_effect=lambda **kw: clipboard["text"]) as read, \
                 patch.object(grid_data_get_strategy.captcha_handler,
-                             "discover_captcha_dialogs", return_value=[{}]), \
+                             "discover_captcha_dialogs",
+                             side_effect=lambda app: [{}] if clipboard["captcha"] else []), \
                 patch.object(grid_data_get_strategy.captcha_handler,
-                             "auto_fill_captcha", return_value=False), \
-                patch.object(grid_data_get_strategy.time, "sleep"):
-            with self.assertRaises(exceptions.GridDataError):
+                             "auto_fill_captcha", return_value=False) as fill:
+            with self.assertRaisesRegex(exceptions.GridDataError, "未能安全自动填写"):
                 self.strategy.get(1047)
-        empty.assert_called_once_with()
+        empty.assert_called_once_with(timeout=1.0)
         self.grid.type_keys.assert_called_once_with("^A^C")
+        read.assert_not_called()
+        fill.assert_called_once_with(self.trader.app)
 
     def test_new_copy_replaces_previous_clipboard_table(self):
         clipboard = {"text": "证券代码\t数量\n600000\t999\n"}
         events = []
 
-        def clear():
+        def clear(**kwargs):
             events.append("clear")
             clipboard["text"] = ""
 
@@ -134,54 +150,106 @@ class TestGridRegressions(unittest.TestCase):
             clipboard["text"] = "证券代码\t数量\n162411\t100\n"
 
         self.grid.type_keys.side_effect = copy
-        with patch.object(grid_data_get_strategy.pywinauto.clipboard,
-                          "EmptyClipboard", side_effect=clear), \
-                patch.object(grid_data_get_strategy.pywinauto.clipboard,
-                             "GetData", side_effect=lambda: clipboard["text"]), \
-                patch.object(grid_data_get_strategy.time, "sleep"):
+        with patch.object(grid_data_get_strategy._clipboard,
+                          "empty", side_effect=clear), \
+                patch.object(grid_data_get_strategy._clipboard,
+                             "read_text", side_effect=lambda **kw: clipboard["text"]):
             records = self.strategy.get(1047)
         self.assertEqual(["clear", "copy"], events)
         self.assertEqual([{"证券代码": "162411", "数量": 100}], records)
 
     def test_captcha_confirm_resumes_original_copy_without_a_second_copy(self):
-        clipboard = {"text": "old table", "captcha": True}
+        clipboard = {"text": "old table", "captcha": False}
         new_table = "证券代码\t数量\n162411\t100\n"
 
-        def clear():
+        def clear(**kwargs):
             clipboard["text"] = ""
+
+        def copy(keys):
+            clipboard["captcha"] = True
 
         def accept(app):
             clipboard["captcha"] = False
             clipboard["text"] = new_table
             return True
 
-        with patch.object(grid_data_get_strategy.pywinauto.clipboard,
-                          "EmptyClipboard", side_effect=clear) as empty, \
-                patch.object(grid_data_get_strategy.pywinauto.clipboard,
-                             "GetData", side_effect=lambda: clipboard["text"]), \
+        self.grid.type_keys.side_effect = copy
+        with patch.object(grid_data_get_strategy._clipboard,
+                          "empty", side_effect=clear) as empty, \
+                patch.object(grid_data_get_strategy._clipboard,
+                             "read_text", side_effect=lambda **kw: clipboard["text"]), \
                 patch.object(grid_data_get_strategy.captcha_handler,
                              "discover_captcha_dialogs",
                              side_effect=lambda app: [{}] if clipboard["captcha"] else []), \
                 patch.object(grid_data_get_strategy.captcha_handler,
-                             "auto_fill_captcha", side_effect=accept), \
-                patch.object(grid_data_get_strategy.time, "sleep"):
+                             "auto_fill_captcha", side_effect=accept) as fill, \
+                patch.object(grid_data_get_strategy.captcha_handler,
+                             "wait_for_captcha_dismissal", return_value=True) as wait:
             records = self.strategy.get(1047)
         self.assertEqual([{"证券代码": "162411", "数量": 100}], records)
-        empty.assert_called_once_with()
+        empty.assert_called_once_with(timeout=1.0)
         self.grid.type_keys.assert_called_once_with("^A^C")
+        fill.assert_called_once_with(self.trader.app)
+        wait.assert_called_once_with(self.trader.app, timeout=5.0)
+
+    def test_existing_captcha_is_confirmed_before_copying_the_current_query(self):
+        clipboard = {"text": "证券代码\t数量\n600000\t999\n", "captcha": True}
+        events = []
+
+        def accept(app):
+            events.append("confirm old captcha")
+            clipboard["captcha"] = False
+            return True
+
+        def clear(**kwargs):
+            events.append("clear old query")
+            clipboard["text"] = ""
+
+        def copy(keys):
+            events.append("copy current query")
+            clipboard["text"] = "证券代码\t数量\n162411\t100\n"
+
+        self.grid.type_keys.side_effect = copy
+        with patch.object(grid_data_get_strategy.captcha_handler,
+                          "discover_captcha_dialogs",
+                          side_effect=lambda app: [{}] if clipboard["captcha"] else []), \
+                patch.object(grid_data_get_strategy.captcha_handler,
+                             "auto_fill_captcha", side_effect=accept) as fill, \
+                patch.object(grid_data_get_strategy._clipboard, "empty", side_effect=clear), \
+                patch.object(grid_data_get_strategy._clipboard, "read_text",
+                             side_effect=lambda **kw: clipboard["text"]):
+            records = self.strategy.get(1047)
+        self.assertEqual([{"证券代码": "162411", "数量": 100}], records)
+        self.assertEqual(["confirm old captcha", "clear old query", "copy current query"], events)
+        fill.assert_called_once_with(self.trader.app)
+
+    def test_existing_dialog_timeout_never_starts_a_new_copy_or_retypes(self):
+        with patch.object(grid_data_get_strategy.captcha_handler,
+                          "discover_captcha_dialogs", return_value=[{}]), \
+                patch.object(grid_data_get_strategy.captcha_handler,
+                             "auto_fill_captcha", return_value=True) as fill, \
+                patch.object(grid_data_get_strategy.captcha_handler,
+                             "wait_for_captcha_dismissal", return_value=False), \
+                patch.object(self.strategy, "_copy_grid") as copy:
+            with self.assertRaisesRegex(exceptions.GridDataError, "5 秒内弹窗仍未关闭"):
+                self.strategy.get(1047)
+        fill.assert_called_once_with(self.trader.app)
+        copy.assert_not_called()
 
     def test_no_recopy_when_captcha_attempt_returns_true_but_dialog_remains(self):
         with patch.object(self.strategy, "_copy_grid", return_value="") as copy, \
-                patch.object(self.strategy, "_get_clipboard_data",
-                             side_effect=exceptions.GridDataError("still blocked")), \
+                patch.object(self.strategy, "_get_clipboard_data") as read, \
                 patch.object(grid_data_get_strategy.captcha_handler,
                              "discover_captcha_dialogs", return_value=[{}]), \
                 patch.object(grid_data_get_strategy.captcha_handler,
-                             "auto_fill_captcha", return_value=True), \
-                patch.object(grid_data_get_strategy.time, "sleep"):
-            with self.assertRaises(exceptions.GridDataError):
-                self.strategy.get(1047)
+                             "auto_fill_captcha", return_value=True) as fill, \
+                patch.object(grid_data_get_strategy.captcha_handler,
+                             "wait_for_captcha_dismissal", return_value=False):
+            with self.assertRaisesRegex(exceptions.GridDataError, "5 秒内弹窗仍未关闭"):
+                self.strategy._read_grid_content(self.grid)
         copy.assert_called_once_with(self.grid)
+        read.assert_not_called()
+        fill.assert_called_once_with(self.trader.app)
 
     def test_recopy_once_if_confirmed_client_did_not_resume_clipboard_copy(self):
         content = "证券代码\t数量\n162411\t100\n"
@@ -189,34 +257,95 @@ class TestGridRegressions(unittest.TestCase):
                 patch.object(self.strategy, "_get_clipboard_data",
                              side_effect=exceptions.GridDataError("no resumed copy")), \
                 patch.object(grid_data_get_strategy.captcha_handler,
-                             "discover_captcha_dialogs", return_value=[]), \
+                             "discover_captcha_dialogs", side_effect=[[{}], []]), \
                 patch.object(grid_data_get_strategy.captcha_handler,
-                             "auto_fill_captcha", return_value=True), \
-                patch.object(grid_data_get_strategy.time, "sleep"):
-            records = self.strategy.get(1047)
-        self.assertEqual([{"证券代码": "162411", "数量": 100}], records)
+                             "auto_fill_captcha", return_value=True) as fill:
+            text = self.strategy._read_grid_content(self.grid)
+        self.assertEqual(content, text)
         self.assertEqual(2, copy.call_count)
+        fill.assert_called_once_with(self.trader.app)
+
+    def test_recopy_failure_is_reported_without_another_captcha_submission(self):
+        with patch.object(self.strategy, "_copy_grid", return_value="") as copy, \
+                patch.object(self.strategy, "_get_clipboard_data",
+                             side_effect=exceptions.GridDataError("blocked")), \
+                patch.object(grid_data_get_strategy.captcha_handler,
+                             "discover_captcha_dialogs", side_effect=[[{}], []]), \
+                patch.object(grid_data_get_strategy.captcha_handler,
+                             "auto_fill_captcha", return_value=True) as fill:
+            with self.assertRaisesRegex(exceptions.GridDataError, "已停止复制"):
+                self.strategy._read_grid_content(self.grid)
+        self.assertEqual(2, copy.call_count)
+        fill.assert_called_once_with(self.trader.app)
 
     def test_clipboard_errors_have_a_bounded_delayed_retry(self):
-        with patch.object(grid_data_get_strategy.pywinauto.clipboard, "GetData",
-                          side_effect=RuntimeError("clipboard locked")) as get, \
-                patch.object(grid_data_get_strategy.captcha_handler,
-                             "discover_captcha_dialogs", return_value=[]), \
+        with patch.object(grid_data_get_strategy._clipboard, "read_text",
+                          side_effect=exceptions.GridDataError("clipboard locked")) as get, \
                 patch.object(grid_data_get_strategy.time, "sleep") as sleep:
-            with self.assertRaises(exceptions.GridDataError):
+            with self.assertRaisesRegex(exceptions.GridDataError, "读取剪贴板超时"):
                 self.strategy._get_clipboard_data()
         self.assertEqual(10, get.call_count)
         self.assertEqual(9, sleep.call_count)
+        self.assertTrue(all(call.kwargs["timeout"] <= 1.0 for call in get.call_args_list))
+
+    def test_blocking_clipboard_call_consumes_deadline_instead_of_ten_timeouts(self):
+        clock = [0.0]
+
+        def read(**kwargs):
+            clock[0] += kwargs["timeout"]
+            raise exceptions.GridDataError("native read timed out")
+
+        with patch.object(grid_data_get_strategy.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(grid_data_get_strategy.time, "sleep",
+                             side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)), \
+                patch.object(grid_data_get_strategy._clipboard, "read_text", side_effect=read) as get:
+            with self.assertRaisesRegex(exceptions.GridDataError, "读取剪贴板超时"):
+                self.strategy._get_clipboard_data()
+        self.assertEqual(3, get.call_count)
+        self.assertAlmostEqual(3.0, clock[0])
+        self.assertAlmostEqual(0.8, get.call_args.kwargs["timeout"])
+
+    def test_clipboard_clear_uses_the_same_three_second_deadline(self):
+        clock = [0.0]
+
+        def clear(**kwargs):
+            clock[0] += kwargs["timeout"]
+            raise exceptions.GridDataError("native clear timed out")
+
+        with patch.object(grid_data_get_strategy.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(grid_data_get_strategy.time, "sleep",
+                             side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)), \
+                patch.object(grid_data_get_strategy._clipboard, "empty", side_effect=clear) as empty:
+            with self.assertRaisesRegex(exceptions.GridDataError, "清空剪贴板超时"):
+                self.strategy._clear_clipboard()
+        self.assertEqual(3, empty.call_count)
+        self.assertAlmostEqual(3.0, clock[0])
+
+    def test_remaining_dialog_prevents_any_native_clipboard_read(self):
+        with patch.object(grid_data_get_strategy.captcha_handler,
+                          "discover_captcha_dialogs", return_value=[{}]), \
+                patch.object(grid_data_get_strategy._clipboard, "read_text") as read:
+            with self.assertRaisesRegex(exceptions.GridDataError, "验证码提示框"):
+                self.strategy._get_clipboard_data()
+        read.assert_not_called()
 
     def test_delayed_copy_waits_for_nonempty_text(self):
         content = "证券代码\t数量\n162411\t100\n"
-        with patch.object(grid_data_get_strategy.pywinauto.clipboard,
-                          "GetData", side_effect=["", content]), \
-                patch.object(grid_data_get_strategy.captcha_handler,
-                             "discover_captcha_dialogs", return_value=[]), \
+        with patch.object(grid_data_get_strategy._clipboard,
+                          "read_text", side_effect=["", content]), \
                 patch.object(grid_data_get_strategy.time, "sleep") as sleep:
             self.assertEqual(content, self.strategy._get_clipboard_data())
         sleep.assert_called_once_with(0.1)
+
+    def test_client_grid_error_does_not_run_hidden_finally_captcha_retry(self):
+        trader = clienttrader.ClientTrader()
+        trader._grid_data_get_strategy = Mock()
+        trader._grid_data_get_strategy.get.side_effect = exceptions.GridDataError("timeout")
+        with patch.object(grid_data_get_strategy.captcha_handler, "auto_fill_captcha") as fill:
+            with self.assertRaisesRegex(exceptions.GridDataError, "timeout"):
+                trader._get_grid_data(1047)
+        trader._grid_data_get_strategy.get.assert_called_once_with(1047)
+        fill.assert_not_called()
 
 
 class TestRemoteRegressions(unittest.TestCase):

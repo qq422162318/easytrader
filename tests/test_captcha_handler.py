@@ -189,7 +189,7 @@ class TestCaptchaAutoFill(unittest.TestCase):
                                  return_value=self.snapshot), \
                     patch.object(captcha_handler, "ocr_pos", return_value=text), \
                     patch.object(captcha_handler, "Application") as application, \
-                    patch.object(captcha_handler.win32gui, "SendMessage") as send:
+                    patch.object(captcha_handler.win32gui, "SendMessageTimeout") as send:
                 self.assertFalse(captcha_handler.auto_fill_captcha(self.app))
                 application.assert_not_called()
                 send.assert_not_called()
@@ -224,7 +224,7 @@ class TestCaptchaAutoFill(unittest.TestCase):
         with patch.object(captcha_handler, "discover_captcha_dialog",
                           return_value=self.snapshot), \
                 patch.object(captcha_handler, "ocr_pos", return_value=" 1234 "), \
-                patch.object(captcha_handler.win32gui, "SendMessage") as send, \
+                patch.object(captcha_handler.win32gui, "SendMessageTimeout") as send, \
                 patch.object(captcha_handler, "Application") as application:
             application.return_value.connect.return_value.window.return_value = dialog
             self.assertTrue(captcha_handler.auto_fill_captcha(self.app))
@@ -241,7 +241,11 @@ class TestCaptchaAutoFill(unittest.TestCase):
         )
         edit.text_block.assert_not_called()
         edit.window_text.assert_not_called()
-        send.assert_called_once_with(3001, captcha_handler.win32con.BM_CLICK, 0, 0)
+        send.assert_called_once_with(
+            3001, captcha_handler.win32con.BM_CLICK, 0, 0,
+            captcha_handler.win32con.SMTO_ABORTIFHUNG | captcha_handler.win32con.SMTO_BLOCK,
+            1000,
+        )
 
     def test_auto_fill_replaces_existing_code_without_edit_text_readback(self):
         dialog = MagicMock()
@@ -261,13 +265,17 @@ class TestCaptchaAutoFill(unittest.TestCase):
         with patch.object(captcha_handler, "discover_captcha_dialog",
                           return_value=self.snapshot), \
                 patch.object(captcha_handler, "ocr_pos", return_value="1234"), \
-                patch.object(captcha_handler.win32gui, "SendMessage") as send, \
+                patch.object(captcha_handler.win32gui, "SendMessageTimeout") as send, \
                 patch.object(captcha_handler, "Application") as application:
             application.return_value.connect.return_value.window.return_value = dialog
             self.assertTrue(captcha_handler.auto_fill_captcha(self.app))
         self.assertEqual("1234", contents[0])
         self.assertEqual(2, edit.type_keys.call_count)
-        send.assert_called_once_with(3001, captcha_handler.win32con.BM_CLICK, 0, 0)
+        send.assert_called_once_with(
+            3001, captcha_handler.win32con.BM_CLICK, 0, 0,
+            captcha_handler.win32con.SMTO_ABORTIFHUNG | captcha_handler.win32con.SMTO_BLOCK,
+            1000,
+        )
 
     def test_auto_fill_reports_ui_failure_without_confirming_or_leaking(self):
         with patch.object(captcha_handler, "discover_captcha_dialog",
@@ -275,11 +283,56 @@ class TestCaptchaAutoFill(unittest.TestCase):
                 patch.object(captcha_handler, "ocr_pos", return_value="1234"), \
                 patch.object(captcha_handler, "Application",
                              side_effect=RuntimeError("private OAuth credential")), \
-                patch.object(captcha_handler.win32gui, "SendMessage") as send, \
+                patch.object(captcha_handler.win32gui, "SendMessageTimeout") as send, \
                 patch.object(captcha_handler.log, "warning") as warning:
             self.assertFalse(captcha_handler.auto_fill_captcha(self.app))
         send.assert_not_called()
         warning.assert_called_once_with("自动填写验证码失败 (%s)", "RuntimeError")
+
+
+    def test_confirmation_timeout_is_not_retried_or_reported_as_success(self):
+        dialog = MagicMock()
+        with patch.object(captcha_handler, "discover_captcha_dialog", return_value=self.snapshot), \
+                patch.object(captcha_handler, "ocr_pos", return_value="8632"), \
+                patch.object(captcha_handler.win32gui, "SendMessageTimeout",
+                             side_effect=RuntimeError("native timeout")) as send, \
+                patch.object(captcha_handler, "Application") as application:
+            application.return_value.connect.return_value.window.return_value = dialog
+            self.assertFalse(captcha_handler.auto_fill_captcha(self.app))
+        self.assertEqual(1, send.call_count)
+        self.assertEqual(2, dialog.child_window.return_value.type_keys.call_count)
+
+
+class TestCaptchaDismissalWait(unittest.TestCase):
+    def test_already_closed_dialog_returns_without_waiting(self):
+        with patch.object(captcha_handler, "discover_captcha_dialogs", return_value=[]), \
+                patch.object(captcha_handler.time, "sleep") as sleep:
+            self.assertTrue(captcha_handler.wait_for_captcha_dismissal(SimpleNamespace(process=4321)))
+        sleep.assert_not_called()
+
+    def test_waits_for_delayed_close_without_reading_input_or_reconfirming(self):
+        app = SimpleNamespace(process=4321)
+        with patch.object(captcha_handler, "discover_captcha_dialogs",
+                          side_effect=[[{}], [], []]) as discover, \
+                patch.object(captcha_handler, "auto_fill_captcha") as fill, \
+                patch.object(captcha_handler.time, "sleep") as sleep:
+            self.assertTrue(captcha_handler.wait_for_captcha_dismissal(app))
+        self.assertEqual(2, discover.call_count)
+        sleep.assert_called_once_with(0.1)
+        fill.assert_not_called()
+
+    def test_remaining_dialog_times_out_at_deadline_without_repeat_actions(self):
+        clock = [0.0]
+        with patch.object(captcha_handler, "discover_captcha_dialogs", return_value=[{}]), \
+                patch.object(captcha_handler.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(captcha_handler.time, "sleep",
+                             side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)), \
+                patch.object(captcha_handler, "auto_fill_captcha") as fill:
+            self.assertFalse(captcha_handler.wait_for_captcha_dismissal(
+                SimpleNamespace(process=4321), timeout=0.25,
+            ))
+        self.assertAlmostEqual(0.25, clock[0])
+        fill.assert_not_called()
 
 
 class TestOptionalOcrDependencies(unittest.TestCase):
@@ -338,11 +391,14 @@ class TestOptionalOcrDependencies(unittest.TestCase):
                 with patch.object(builtins, "open", unittest.mock.mock_open(read_data=b"mock")):
                     self.assertEqual(expected, captcha_handler.baidu_ocr("mock.png"))
 
-    def test_opencv_receives_bgra_and_sends_thresholded_png(self):
+    def test_opencv_receives_bgra_and_sends_grayscale_before_binary(self):
         from types import ModuleType
         from PIL import Image
         mss = ModuleType("mss")
-        screenshot = SimpleNamespace(size=(2, 1), bgra=bytes((255, 0, 0, 0, 0, 0, 255, 0)))
+        screenshot = SimpleNamespace(
+            size=(2, 1), bgra=bytes((255, 0, 0, 0, 0, 0, 255, 0)),
+            rgb=bytes((0, 0, 255, 255, 0, 0)),
+        )
         capture = MagicMock()
         capture.__enter__.return_value.grab.return_value = screenshot
         mss.mss = Mock(return_value=capture)
@@ -361,22 +417,23 @@ class TestOptionalOcrDependencies(unittest.TestCase):
         def ocr(path):
             with Image.open(path) as image:
                 self.assertEqual((22, 19), image.size)
-                self.assertEqual({0, 255}, set(image.tobytes()))
-            return "1234"
+                self.assertEqual({120, 255}, set(image.tobytes()))
+            return "8632"
 
         binary = Image.new("L", (6, 3), 0)
-        binary.putpixel((5, 2), 255)
+        gray_image = Image.new("L", (6, 3), 120)
         with patch.dict("sys.modules", {"mss": mss, "cv2": cv2, "numpy": np}), \
-                patch.object(Image, "fromarray", return_value=binary), \
-                patch.object(captcha_handler, "baidu_ocr", side_effect=ocr):
-            self.assertEqual("1234", captcha_handler.ocr_pos(20, 10, 2, 1))
+                patch.object(Image, "fromarray", side_effect=[binary, gray_image]), \
+                patch.object(captcha_handler, "baidu_ocr", side_effect=ocr) as recognize:
+            self.assertEqual("8632", captcha_handler.ocr_pos(20, 10, 2, 1))
+        recognize.assert_called_once()
         np.frombuffer.assert_called_once_with(screenshot.bgra, dtype=np.uint8)
         pixels.reshape.assert_called_once_with(1, 2, 4)
         cv2.cvtColor.assert_called_once_with(array, cv2.COLOR_BGRA2GRAY)
         cv2.resize.assert_called_once_with(gray, (6, 3), interpolation=cv2.INTER_CUBIC)
         cv2.threshold.assert_called_once_with(enlarged, 150, 255, cv2.THRESH_BINARY)
 
-    def test_incomplete_binary_ocr_retries_same_captcha_as_gray_once(self):
+    def test_incomplete_gray_ocr_retries_same_captcha_as_binary_once(self):
         from types import ModuleType
         from PIL import Image
         mss = ModuleType("mss")
@@ -396,7 +453,7 @@ class TestOptionalOcrDependencies(unittest.TestCase):
         with patch.dict("sys.modules", {"mss": mss, "cv2": None, "numpy": None}), \
                 patch.object(captcha_handler, "baidu_ocr", side_effect=ocr):
             self.assertEqual("8557", captcha_handler.ocr_pos(0, 0, 2, 2))
-        self.assertEqual([{0, 255}, {120, 255}], seen_pixels)
+        self.assertEqual([{120, 255}, {0, 255}], seen_pixels)
         self.assertEqual(2, len(paths))
         self.assertEqual(paths[0], paths[1])
         capture.__enter__.return_value.grab.assert_called_once_with(
@@ -412,7 +469,7 @@ class TestOptionalOcrDependencies(unittest.TestCase):
         mss.mss = Mock(return_value=capture)
         with patch.dict("sys.modules", {"mss": mss, "cv2": None, "numpy": None}), \
                 patch.object(captcha_handler, "baidu_ocr", return_value="5") as ocr:
-            self.assertEqual("5", captcha_handler.ocr_pos(0, 0, 2, 2))
+            self.assertEqual("", captcha_handler.ocr_pos(0, 0, 2, 2))
         self.assertEqual(2, ocr.call_count)
 
     def test_screenshot_uses_a_private_file_and_removes_it(self):
@@ -436,18 +493,106 @@ class TestOptionalOcrDependencies(unittest.TestCase):
                 self.assertEqual("L", image.mode)
                 self.assertEqual((22, 22), image.size)
                 self.assertEqual(255, image.getpixel((0, 0)))
-                self.assertEqual({0, 255}, set(image.tobytes()))
-            return "1234"
+                self.assertTrue(set(image.tobytes()) - {0, 255})
+            return "8632"
 
         mss.mss = Mock(return_value=capture)
         with patch.dict("sys.modules", {"mss": mss, "cv2": None, "numpy": None}), \
                 patch.object(captcha_handler, "baidu_ocr", side_effect=ocr):
-            self.assertEqual("1234", captcha_handler.ocr_pos(0, 0, 2, 2))
-            self.assertEqual("1234", captcha_handler.ocr_pos(0, 0, 2, 2))
+            self.assertEqual("8632", captcha_handler.ocr_pos(0, 0, 2, 2))
+            self.assertEqual("8632", captcha_handler.ocr_pos(0, 0, 2, 2))
         self.assertEqual(2, len(set(captured_paths)))
         self.assertTrue(all(not os.path.exists(path) for path in captured_paths))
         self.assertTrue(all(not os.path.isdir(os.path.dirname(path))
                             for path in captured_paths))
+
+
+class TestCaptchaOneFourAmbiguity(unittest.TestCase):
+    def setUp(self):
+        from types import ModuleType
+        self.mss = ModuleType("mss")
+        self.capture = MagicMock()
+        self.capture.__enter__.return_value.grab.return_value = SimpleNamespace(
+            rgb=bytes((120, 50, 250)) * 4, size=(2, 2),
+        )
+        self.mss.mss = Mock(return_value=self.capture)
+
+    def _recognize(self, replies):
+        from PIL import Image
+        replies = iter(replies)
+        modes = []
+
+        def ocr(path):
+            with Image.open(path) as image:
+                modes.append(image.mode)
+                self.assertEqual((22, 22), image.size)
+            return next(replies)
+
+        with patch.dict("sys.modules", {"mss": self.mss, "cv2": None, "numpy": None}), \
+                patch.object(captcha_handler, "baidu_ocr", side_effect=ocr) as request:
+            text = captcha_handler.ocr_pos(0, 0, 2, 2)
+        self.capture.__enter__.return_value.grab.assert_called_once_with(
+            {"top": 0, "left": 0, "width": 2, "height": 2}
+        )
+        self.assertEqual(len(modes), request.call_count)
+        return text, modes
+
+    def test_gray_and_color_agreement_preserves_four(self):
+        text, modes = self._recognize(["4964", "4964"])
+        self.assertEqual("4964", text)
+        self.assertEqual(["L", "RGB"], modes)
+
+    def test_gray_and_color_agreement_preserves_real_one(self):
+        text, modes = self._recognize(["1961", "1961"])
+        self.assertEqual("1961", text)
+        self.assertEqual(["L", "RGB"], modes)
+
+    def test_four_digit_one_four_conflict_does_not_guess(self):
+        with patch.object(captcha_handler.log, "warning") as warning:
+            text, modes = self._recognize(["1964", "4964"])
+        self.assertEqual("", text)
+        self.assertEqual(["L", "RGB"], modes)
+        warning.assert_called_once_with("验证码 1/4 识别核验不一致，已停止自动填写")
+
+    def test_incomplete_color_check_does_not_accept_gray_candidate(self):
+        text, modes = self._recognize(["4964", "49"])
+        self.assertEqual("", text)
+        self.assertEqual(["L", "RGB"], modes)
+
+    def test_binary_fallback_also_cross_checks_one_four_and_stops_at_three(self):
+        text, modes = self._recognize(["5", "1964", "4964"])
+        self.assertEqual("", text)
+        self.assertEqual(["L", "L", "RGB"], modes)
+
+    def test_agreed_binary_candidate_is_accepted_after_color_check(self):
+        text, modes = self._recognize(["5", "1961", "1961"])
+        self.assertEqual("1961", text)
+        self.assertEqual(["L", "L", "RGB"], modes)
+
+    def test_unambiguous_gray_code_uses_only_one_ocr_request(self):
+        text, modes = self._recognize(["8557"])
+        self.assertEqual("8557", text)
+        self.assertEqual(["L"], modes)
+
+    def test_conflicting_one_four_result_never_clears_input_or_clicks(self):
+        snapshot = {
+            "dialog_hwnd": 200,
+            "controls": [
+                {"control_id": 2405, "class_name": "Static", "hwnd": 3005,
+                 "rect": (0, 0, 2, 2)},
+                {"control_id": 2404, "class_name": "Edit", "hwnd": 3004},
+                {"control_id": 1, "class_name": "Button", "hwnd": 3001},
+            ],
+        }
+        with patch.dict("sys.modules", {"mss": self.mss, "cv2": None, "numpy": None}), \
+                patch.object(captcha_handler, "baidu_ocr", side_effect=["1964", "4964"]) as ocr, \
+                patch.object(captcha_handler, "discover_captcha_dialog", return_value=snapshot), \
+                patch.object(captcha_handler, "Application") as application, \
+                patch.object(captcha_handler.win32gui, "SendMessageTimeout") as send:
+            self.assertFalse(captcha_handler.auto_fill_captcha(SimpleNamespace(process=4321)))
+        self.assertEqual(2, ocr.call_count)
+        application.assert_not_called()
+        send.assert_not_called()
 
 
 if __name__ == "__main__":
