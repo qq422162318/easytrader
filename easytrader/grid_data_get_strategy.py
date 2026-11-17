@@ -56,7 +56,10 @@ class CopyStrategy(BaseStrategy):
         # 上一次复制的弹窗仍在时，不能先清空/再次复制。先确认并等待关闭；
         # 旧复制可能来自别的查询页，不能把它的剪贴板当成本次查询结果。
         if captcha_handler.discover_captcha_dialogs(self._trader.app):
-            self._submit_captcha_and_wait()
+            try:
+                captcha_handler.guard(self._trader.app, "复制表格数据")
+            except exceptions.CaptchaError as exc:
+                raise exceptions.GridDataError(str(exc)) from exc
         grid = self._get_grid(control_id)
         content = self._read_grid_content(grid)
 

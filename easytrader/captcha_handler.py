@@ -164,33 +164,6 @@ def discover_captcha_dialog(app):
     accidentally enter an OCR code into the client.
     """
     dialogs = discover_captcha_dialogs(app)
-    if dialogs:
-        dialog = dialogs[0]
-
-        print("弹窗 HWND:", hex(dialog["dialog_hwnd"]))
-        print("弹窗 PID:", dialog["pid"])
-        for control in dialog["controls"]:
-            print(
-                hex(control["hwnd"]),
-                control["control_id"],
-                control["class_name"],
-                repr(control["text"]),
-            )
-        image_control = next(
-            (i for i in dialog["controls"] if i["control_id"] == 2405), None
-        )
-        edit_control = next(
-            (i for i in dialog["controls"] if i["control_id"] == 2404), None
-        )
-        yes_control = next(
-            (i for i in dialog["controls"] if i["control_id"] == 1), None
-        )
-        if image_control:
-            print("图片控件 HWND:", hex(image_control["hwnd"]))
-        if edit_control:
-            print("输入框 HWND:", hex(edit_control["hwnd"]))
-        if yes_control:
-            print("确定按钮 HWND:", hex(yes_control["hwnd"]))
     return dialogs[0] if dialogs else None
 
 
@@ -435,17 +408,22 @@ def get_captcha_edit_handle(app):
 
 
 def guard(app, action="读取表格数据"):
-    """Raise ``CaptchaError`` when the client requires manual captcha entry."""
+    """Handle a captcha dialog before allowing the guarded action to continue."""
     if not is_captcha_dialog_displayed(app):
         return
 
     from . import exceptions
 
-    raise exceptions.CaptchaError(
-        "客户端弹出验证码提示框, {} 失败。"
-        "同花顺在检测到频繁拷贝数据时需要人工输入验证码, "
-        "请在客户端完成验证码处理后再重试。".format(action)
-    )
+    if not auto_fill_captcha(app):
+        raise exceptions.CaptchaError(
+            "客户端弹出验证码提示框, {} 无法自动填写；"
+            "请在客户端人工填写验证码并点击确定后再重试。".format(action)
+        )
+    if not wait_for_captcha_dismissal(app, timeout=5.0):
+        raise exceptions.CaptchaError(
+            "验证码提交后 5 秒内弹窗仍未关闭, {} 已停止；"
+            "请在客户端检查验证码并点击确定后再重试。".format(action)
+        )
 
 
 def dismiss_captcha_dialog(app):
